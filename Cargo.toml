@@ -1,0 +1,49 @@
+[package]
+name        = "luany-secrets"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Luany <luany@luanysecrets.com>"]
+description = "Proteção e partilha ultra-rápida de ficheiros sensíveis com AES-256-GCM"
+license     = "MIT"
+repository  = "https://github.com/luany/luany-secrets"
+keywords    = ["encryption", "security", "aes", "files", "secrets"]
+categories  = ["cryptography", "command-line-utilities"]
+
+[[bin]]
+name = "lsec"
+path = "src/main.rs"
+
+[dependencies]
+# ── Criptografia de nível militar ─────────────────────────────────────────────
+aes-gcm    = "0.10"
+argon2     = { version = "0.5", features = ["std"] }
+rand       = "0.8"
+
+# ── Segurança de memória RAM (apagar chaves após uso) ─────────────────────────
+zeroize    = { version = "1.7", features = ["derive"] }
+
+# ── Keychain nativo do sistema operativo ─────────────────────────────────────
+keyring    = "2.3"
+
+# ── Interface de linha de comandos ────────────────────────────────────────────
+clap       = { version = "4.4", features = ["derive"] }
+
+# ── Ficheiros temporários e abertura de aplicações ───────────────────────────
+tempfile   = "3.8"
+open       = "5.0"
+
+# ── Serialização (registo de sessões) ────────────────────────────────────────
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ── Utilitários ───────────────────────────────────────────────────────────────
+dirs       = "5.0"
+rpassword  = "7.3"
+indicatif  = "0.17"
+
+[profile.release]
+opt-level   = 3       # Optimização máxima de performance
+lto         = true    # Link-Time Optimisation — reduz tamanho do binário
+codegen-units = 1     # Melhor optimização (mais lento a compilar, binário menor)
+strip       = true    # Remove símbolos de debug do binário final
+panic       = "abort" # Sem stack unwinding — binário mais pequeno e seguro
