@@ -13,7 +13,7 @@
 //!   - Environment  : lida de LS_MASTER_PASSWORD (pipelines CI/CD)
 
 use argon2::{Argon2, Algorithm, Version, Params};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 use std::io;
 
 // ── Parâmetros Argon2id ───────────────────────────────────────────────────────

@@ -217,18 +217,32 @@ fn cmd_unlock(path: &Path) -> std::io::Result<()> {
     let (header, ct) = read_ls(path)?;
     let password     = get_session_password()?;
     let master_key   = crypto::kdf::derive_master_key(password, &header.salt)?;
-    let dek          = decrypt_slot1(&header, &master_key)?;
-    let plaintext    = crypto::aes::decrypt_file_body(&ct, &dek, &header.nonce_principal)?;
+
+    // ← NOVO: se a senha estiver errada, limpar a sessão cacheada
+    let dek = match decrypt_slot1(&header, &master_key) {
+        Ok(d) => d,
+        Err(e) => {
+            storage::os_keyring::clear_session().ok();
+            return Err(e);
+        }
+    };
+
+    let plaintext = crypto::aes::decrypt_file_body(&ct, &dek, &header.nonce_principal)?;
 
     let name = decode_filename(&header.email_proprietario);
     let out  = path.parent().unwrap_or(Path::new(".")).join(&name);
     std::fs::write(&out, &plaintext)?;
 
-    println!("✅  Restaurado: {}", out.display());
-    println!("⚠️   Lembra-te de proteger novamente após editar:");
+    std::fs::remove_file(path)?;
+
+    println!("✅ Restaurado: {}", out.display());
+    println!("    O ficheiro .ls foi removido.\n");
+    println!("⚠️  Lembra-te de proteger novamente após editar:");
     println!("    lsec lock {}\n", out.display());
     Ok(())
 }
+
+
 
 fn cmd_edit(path: &Path) -> std::io::Result<()> {
     require_ls(path)?;
@@ -237,16 +251,62 @@ fn cmd_edit(path: &Path) -> std::io::Result<()> {
 
     let (header, ct) = read_ls(path)?;
     let password     = get_session_password()?;
-    let master_key   = crypto::kdf::derive_master_key(password, &header.salt)?;
-    let dek          = decrypt_slot1(&header, &master_key)?;
-    let plaintext    = Zeroizing::new(
+    let master_key   = crypto::kdf::derive_master_key(password.clone(), &header.salt)?;
+
+    let dek = match decrypt_slot1(&header, &master_key) {
+        Ok(d) => d,
+        Err(e) => {
+            storage::os_keyring::clear_session().ok();
+            return Err(e);
+        }
+    };
+    
+    let plaintext = Zeroizing::new(
         crypto::aes::decrypt_file_body(&ct, &dek, &header.nonce_principal)?
     );
-    let name         = decode_filename(&header.email_proprietario);
+    let name = decode_filename(&header.email_proprietario);
 
-    utils::temp_watcher::open_and_watch(plaintext, &name, path)?;
+    let edited = utils::temp_watcher::open_and_watch(plaintext, &name, path)?;
+
+    if let Some(new_content) = edited {
+        println!("💾  A guardar alterações em {}...", path.display());
+
+        let new_nonce   = crypto::aes::generate_nonce();
+        let new_dek     = crypto::aes::generate_dek();
+        let new_salt    = rand_bytes::<SALT_LEN>();
+        let new_mk      = crypto::kdf::derive_master_key(password, &new_salt)?;
+        let slot_nonce  = crypto::aes::generate_nonce();
+        let enc_dek     = crypto::aes::encrypt_dek(&new_dek, &new_mk, &slot_nonce)?;
+        let new_ct      = crypto::aes::encrypt_file_body(&new_content, &new_dek, &new_nonce)?;
+
+        let new_header = LsHeader {
+            versao: 1,
+            id_auditoria:       machine_id(),
+            email_proprietario: encode_filename(Path::new(&name)),
+            nonce_principal:    new_nonce,
+            salt:               new_salt,
+            slot_local: KeySlot {
+                encrypted_dek: enc_dek[..32].try_into().unwrap(),
+                nonce:          slot_nonce,
+                tag:            enc_dek[32..].try_into().unwrap(),
+            },
+            slot_partilha: KeySlot::empty(),
+            slot_futuro:   KeySlot::empty(),
+        };
+
+        let mut output = Vec::with_capacity(HEADER_SIZE + new_ct.len());
+        output.extend_from_slice(new_header.serialize()?.as_ref());
+        output.extend_from_slice(&new_ct);
+        std::fs::write(path, &output)?;
+
+        println!("✅  Alterações guardadas e re-encriptadas em {}\n", path.display());
+    } else {
+        println!("ℹ️   Sem alterações detectadas.\n");
+    }
+
     Ok(())
 }
+
 
 fn cmd_share(path: &Path, dest: Option<&str>) -> std::io::Result<()> {
     require_ls(path)?;

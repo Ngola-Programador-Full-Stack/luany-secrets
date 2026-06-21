@@ -17,7 +17,8 @@
 //!   Aplicações como Excel e VS Code exigem um caminho de ficheiro físico.
 //!   Não conseguem ler da RAM de outro processo. O ficheiro temporário
 //!   existe apenas durante a sessão de edição — nunca além disso.
-
+//use zeroize::Zeroizing;
+use zeroize::Zeroize;
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
@@ -86,18 +87,13 @@ pub fn open_and_watch(
     mut decrypted_bytes: Zeroizing<Vec<u8>>,
     original_name: &str,
     ls_path: &Path,
-) -> io::Result<()> {
-    // Criar directório temporário seguro gerido pelo OS
+) -> io::Result<Option<Vec<u8>>> {   // ← retorna conteúdo editado ou None
     let temp_dir  = tempfile::tempdir()?;
     let temp_path = temp_dir.path().join(original_name);
 
-    // Escrever conteúdo decifrado no disco temporário
     std::fs::write(&temp_path, decrypted_bytes.as_slice())?;
-
-    // Apagar o vetor da RAM imediatamente após escrita — já está em disco
     decrypted_bytes.zeroize();
 
-    // Registar sessão antes de abrir (protecção anti-crash)
     let session = TempSession {
         session_id: new_session_id(),
         temp_path:  temp_path.to_string_lossy().to_string(),
@@ -106,32 +102,29 @@ pub fn open_and_watch(
     };
     register_session(&session)?;
 
-    // Abrir com aplicação padrão do sistema operativo
     println!("📂  A abrir {} ...", original_name);
     open::that(&temp_path).map_err(|e| io::Error::new(
         io::ErrorKind::Other,
-        format!(
-            "Não foi possível abrir o ficheiro: {}\n\
-             Verifica se tens uma aplicação associada ao formato '.{}'.",
-            e,
-            Path::new(original_name)
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ),
+        format!("Não foi possível abrir o ficheiro: {}", e),
     ))?;
 
-    // MVP: Enter manual — Fase 2 implementará monitorização de PID nativa
     println!();
     println!("    ┌──────────────────────────────────────────────────────┐");
     println!("    │  Ficheiro aberto em modo seguro.                     │");
+    println!("    │  Edita e guarda o ficheiro na aplicação.             │");
     println!("    │  Quando terminar, fecha a aplicação e prime ENTER.   │");
     println!("    └──────────────────────────────────────────────────────┘");
 
     let mut _input = String::new();
     std::io::stdin().read_line(&mut _input)?;
 
-    // Destruir ficheiro temporário
+    // ← NOVO: ler o conteúdo editado ANTES de destruir o temporário
+    let edited_content = if temp_path.exists() {
+        Some(std::fs::read(&temp_path)?)
+    } else {
+        None
+    };
+
     println!("\n🔒  A destruir ficheiro temporário...");
     match crate::utils::shredder::shred_file(&temp_path) {
         Ok(result) => {
@@ -140,22 +133,14 @@ pub fn open_and_watch(
                 println!("\n{}", w);
             }
         }
-        Err(_) => {
-            // temp_dir (drop abaixo) limpa igualmente — não é erro crítico
-        }
+        Err(_) => {}
     }
 
-    // Limpar registo de sessão
     unregister_session(&session.session_id)?;
 
-    println!(
-        "\n✅  {} continua protegido.\n",
-        ls_path.file_name().unwrap_or_default().to_string_lossy()
-    );
-
-    Ok(())
-    // temp_dir dropped aqui — OS remove o directório mesmo se o shred falhou
+    Ok(edited_content)  // ← retorna ao cmd_edit para re-encriptar
 }
+
 
 // ── Helpers de registo ────────────────────────────────────────────────────────
 
