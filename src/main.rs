@@ -76,6 +76,11 @@ enum Command {
 
     /// Mostrar estado da sessão e configuração actual
     Status,
+
+    /// Verificar se um .ls está estruturalmente íntegro (sem precisar da senha)
+    Verify {
+        file: PathBuf,
+    },
 }
 
 // ── PONTO DE ENTRADA ─────────────────────────────────────────────────────────
@@ -96,6 +101,7 @@ fn main() {
         Command::Share  { file, dest }  => cmd_share(&file, dest.as_deref()),
         Command::Logout                 => cmd_logout(),
         Command::Status                 => cmd_status(),
+        Command::Verify { file } => cmd_verify(&file),
     };
 
     if let Err(e) = result {
@@ -161,15 +167,12 @@ fn cmd_lock(path: &Path) -> std::io::Result<()> {
     let dek        = crypto::aes::generate_dek();
     let master_key = crypto::kdf::derive_master_key(password, &salt)?;
 
-    // Cifrar DEK para Key Slot 1 (acesso local)
     let slot1_nonce = crypto::aes::generate_nonce();
     let enc_dek     = crypto::aes::encrypt_dek(&dek, &master_key, &slot1_nonce)?;
 
-    // Cifrar corpo do ficheiro
     let plaintext  = std::fs::read(path)?;
     let ciphertext = crypto::aes::encrypt_file_body(&plaintext, &dek, &nonce)?;
 
-    // Construir cabeçalho binário de 512 bytes
     let header = LsHeader {
         versao: 1,
         id_auditoria:       machine_id(),
@@ -185,26 +188,41 @@ fn cmd_lock(path: &Path) -> std::io::Result<()> {
         slot_futuro:   KeySlot::empty(),
     };
 
-    // Escrever ficheiro .ls = cabeçalho (512B) + corpo cifrado
     let ls_path = path.with_file_name(format!(
         "{}.ls",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
+
+    // Se já existir um .ls de uma tentativa anterior, remover a protecção read-only antes de sobrescrever
+    if ls_path.exists() {
+        set_readonly(&ls_path, false)?;
+    }
+
     let mut output = Vec::with_capacity(HEADER_SIZE + ciphertext.len());
     output.extend_from_slice(header.serialize()?.as_ref());
     output.extend_from_slice(&ciphertext);
-    std::fs::write(&ls_path, &output)?;
+    std::fs::write(&ls_path, &output)?;          // ← escreve UMA VEZ
+    set_readonly(&ls_path, true)?;
 
-    // Destruir original de forma segura
+    // Destruir original — UMA VEZ
     let shred = utils::shredder::shred_file(path)?;
 
     println!("✅  Ficheiro protegido:  {}", ls_path.display());
     println!("    Shredding original:  {} passes (padrão DoD)", shred.passes_completed);
-    if let Some(w) = shred.ssd_warning {
-        println!("\n{}\n", w);
-    } else {
-        println!();
+    println!("    🔒  Marcado como só-leitura no sistema operativo.");
+    println!("    ⚠️   Nunca edites este ficheiro directamente — usa 'lsec edit'.");
+
+    // ← NOVO: verificar honestamente se o ficheiro original foi mesmo apagado
+    if !shred.file_deleted {
+        println!("\n⚠️   AVISO: o ficheiro original foi sobrescrito mas NÃO foi possível");
+        println!("    apagá-lo do sistema de ficheiros (pode estar bloqueado por outro processo).");
+        println!("    Verifica manualmente: {}", path.display());
     }
+
+    if let Some(w) = shred.ssd_warning {
+        println!("\n{}", w);
+    }
+    println!();
 
     Ok(())
 }
@@ -238,11 +256,9 @@ fn cmd_unlock(path: &Path) -> std::io::Result<()> {
     println!("✅ Restaurado: {}", out.display());
     println!("    O ficheiro .ls foi removido.\n");
     println!("⚠️  Lembra-te de proteger novamente após editar:");
-    println!("    lsec lock {}\n", out.display());
+    println!("    lsec lock \"{}\"\n", out.display());
     Ok(())
 }
-
-
 
 fn cmd_edit(path: &Path) -> std::io::Result<()> {
     require_ls(path)?;
@@ -297,7 +313,10 @@ fn cmd_edit(path: &Path) -> std::io::Result<()> {
         let mut output = Vec::with_capacity(HEADER_SIZE + new_ct.len());
         output.extend_from_slice(new_header.serialize()?.as_ref());
         output.extend_from_slice(&new_ct);
+        //std::fs::write(path, &output)?;
+        set_readonly(path, false)?;          // ← NOVO: remover para poder escrever
         std::fs::write(path, &output)?;
+        set_readonly(path, true)?;           // ← NOVO: voltar a trancar
 
         println!("✅  Alterações guardadas e re-encriptadas em {}\n", path.display());
     } else {
@@ -358,6 +377,32 @@ fn cmd_status() -> std::io::Result<()> {
     println!("    Cabeçalho :  512 bytes  (3 Key Slots)");
     println!("    Shredding :  DoD 5220.22-M  (3 passes)");
     println!();
+    Ok(())
+}
+
+fn cmd_verify(path: &Path) -> std::io::Result<()> {
+    require_ls(path)?;
+    let raw = std::fs::read(path)?;
+
+    if raw.len() <= HEADER_SIZE {
+        println!("\n❌  Ficheiro demasiado pequeno — estrutura inválida.\n");
+        return Ok(());
+    }
+
+    let hdr_bytes: [u8; HEADER_SIZE] = raw[..HEADER_SIZE].try_into().unwrap();
+    match LsHeader::deserialize(&hdr_bytes) {
+        Ok(h) => {
+            let name = decode_filename(&h.email_proprietario);
+            println!("\n✅  Cabeçalho íntegro.");
+            println!("    Ficheiro original : {}", name);
+            println!("    Versão do formato : {}", h.versao);
+            println!("    Tamanho total     : {} bytes\n", raw.len());
+        }
+        Err(e) => {
+            println!("\n❌  Cabeçalho corrompido: {}", e);
+            println!("    Este ficheiro está irrecuperável. Precisas de o restaurar de um backup.\n");
+        }
+    }
     Ok(())
 }
 
@@ -479,4 +524,13 @@ fn machine_id() -> [u8; 32] {
     let len     = b.len().min(32);
     id[..len].copy_from_slice(&b[..len]);
     id
+}
+
+/// Marca/desmarca o ficheiro como só-leitura no SO.
+/// Protecção de UX contra escrita acidental fora do lsec —
+/// NÃO é uma medida de segurança (a tag GCM já garante integridade).
+fn set_readonly(path: &Path, readonly: bool) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_readonly(readonly);
+    std::fs::set_permissions(path, perms)
 }
